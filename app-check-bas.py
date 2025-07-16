@@ -214,7 +214,7 @@ def main():
     """,
     unsafe_allow_html=True)
     
-    st.title("Buurfashion Leverblok Updater (Stap 1: Lookup → Stap 2: Merge)")
+    st.title("B Fashion Brands Leverblok Updater (Stap 1: Lookup → Stap 2: Merge)")
 
     if "token" not in st.session_state:
         st.write("Stap 1: Inloggen")
