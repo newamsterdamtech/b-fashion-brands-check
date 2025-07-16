@@ -64,19 +64,13 @@ def extract_base_artikelnummer(artikelnummer):
     return re.sub(r"\sL\d+$", "", artikelnummer.strip())
 
 def normalize_kleurnummer(kleurnummer):
-    # Always work with string, remove trailing .0 (from Excel float import)
+    # Remove .0 if float imported as Excel
     kleurnummer_str = str(kleurnummer).strip()
     if kleurnummer_str.endswith('.0'):
         kleurnummer_str = kleurnummer_str[:-2]
+    # Pad to exactly 4 digits, left with zeros
     if kleurnummer_str.isdigit():
-        if len(kleurnummer_str) == 1:
-            return '00' + kleurnummer_str
-        elif len(kleurnummer_str) == 2:
-            return '00' + kleurnummer_str
-        elif len(kleurnummer_str) == 3:
-            return '0' + kleurnummer_str
-        else:
-            return kleurnummer_str
+        return kleurnummer_str.zfill(4)
     return kleurnummer_str
 
 def process_lookup(df, artikel_col, kleur_col):
