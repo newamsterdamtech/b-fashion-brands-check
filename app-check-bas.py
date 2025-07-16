@@ -217,7 +217,7 @@ def main():
     st.title("B Fashion Brands Leverblok Updater")
 
     if "token" not in st.session_state:
-        st.write("Stap 1: Inloggen")
+        st.header("Stap 1: Inloggen")
         username = st.text_input("Gebruikersnaam", key="username_input")
         password = st.text_input("Wachtwoord", type="password", key="password_input")
         login_btn = st.button("Inloggen")
@@ -233,7 +233,7 @@ def main():
                 st.error(f"Inloggen mislukt: {e}")
 
     if "token" in st.session_state:
-        st.write("Stap 2: Upload Excel bestand 'check Bas.xlsx'")
+        st.header("Stap 2: Upload Excel bestand 'check Bas.xlsx'")
         file = st.file_uploader("Upload Excel", type=["xlsx"])
         if file:
             df = pd.read_excel(file)
