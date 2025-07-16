@@ -1,9 +1,201 @@
 import streamlit as st
 import pandas as pd
+import requests
+import time
 import io
-import csv
+import re
 
-st.markdown(
+BASE_URL = "https://buurfashion.itsperfect.it/api/v3"
+DELAY_BETWEEN_REQUESTS = 0.5  # seconds
+MAX_RATE_LIMIT_SLEEP = 10     # seconds
+
+def get_bearer_token(username, password):
+    url = f"{BASE_URL}/authentication"
+    data = {"username": username, "password": password}
+    resp = requests.post(url, json=data)
+    resp.raise_for_status()
+    resp_data = resp.json()
+    token = resp_data["token"]
+    expires_in = resp_data.get("expires_in", 1740)
+    expiry_timestamp = time.time() + expires_in - 60
+    return token, expiry_timestamp
+
+def ensure_valid_token():
+    if (
+        "token" not in st.session_state or
+        "token_expiry" not in st.session_state or
+        time.time() > st.session_state.token_expiry
+    ):
+        username = st.session_state.get("username")
+        password = st.session_state.get("password")
+        if not username or not password:
+            raise Exception("Missing credentials to re-authenticate!")
+        token, expiry = get_bearer_token(username, password)
+        st.session_state.token = token
+        st.session_state.token_expiry = expiry
+    return st.session_state.token
+
+def handle_rate_limits(resp):
+    bucket_size = int(resp.headers.get("X-Bucket-Size", 100))
+    marbles = int(resp.headers.get("X-Marbles-In-Bucket", 0))
+    remaining = int(resp.headers.get("X-Remaining-Requests", bucket_size))
+    if marbles >= bucket_size - 2 or remaining <= 2:
+        calculated_wait = (marbles - remaining + 2) * 4
+        wait_time = min(max(calculated_wait, 1), MAX_RATE_LIMIT_SLEEP)
+        print(f"[handle_rate_limits] Bucket full/near. Sleeping {wait_time}s (calculated {calculated_wait}s).")
+        st.info(f"Rate limit near, sleeping {wait_time} seconds to avoid 429.")
+        time.sleep(wait_time)
+    return
+
+def safe_get(url, headers, params=None):
+    while True:
+        print(f"[safe_get] Making API call: {url} params={params}")
+        resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code == 429:
+            print("[safe_get] 429 received. Sleeping 3 seconds before retry.")
+            st.warning("Rate limited (429), sleeping for 3 seconds...")
+            time.sleep(3)
+            continue
+        handle_rate_limits(resp)
+        return resp
+
+def extract_base_artikelnummer(artikelnummer):
+    # Remove space and LXX or similar at the end (e.g., "A005684 L30" -> "A005684")
+    return re.sub(r"\sL\d+$", "", artikelnummer.strip())
+
+def normalize_kleurnummer(kleurnummer):
+    # Always work with string, remove trailing .0 (from Excel float import)
+    kleurnummer_str = str(kleurnummer).strip()
+    if kleurnummer_str.endswith('.0'):
+        kleurnummer_str = kleurnummer_str[:-2]
+    if kleurnummer_str.isdigit():
+        if len(kleurnummer_str) == 1:
+            return '00' + kleurnummer_str
+        elif len(kleurnummer_str) == 2:
+            return '00' + kleurnummer_str
+        elif len(kleurnummer_str) == 3:
+            return '0' + kleurnummer_str
+        else:
+            return kleurnummer_str
+    return kleurnummer_str
+
+def process_lookup(df, artikel_col, kleur_col):
+    lookup_rows = []
+    n_rows = len(df)
+    progress = st.progress(0)
+    for i, row in df.iterrows():
+        artikelnummer_full = str(row[artikel_col]).strip()
+        artikelnummer_base = extract_base_artikelnummer(artikelnummer_full)
+        kleurnummer_raw = row[kleur_col]
+        kleurnummer_clean = normalize_kleurnummer(kleurnummer_raw)
+        article_found = False
+        leverblok = ""
+
+        if not artikelnummer_base or artikelnummer_base == 'nan':
+            lookup_rows.append({
+                "artikelnummer": artikelnummer_full,
+                "kleurnummer": kleurnummer_clean,
+                "delivery_block": ""
+            })
+            continue
+        try:
+            token = ensure_valid_token()
+        except Exception as e:
+            st.error(f"Token error: {e}")
+            break
+
+        headers = {"Authorization": f"Bearer {token}"}
+        url_item = f"{BASE_URL}/items"
+
+        # --- 1st attempt: original artikelnummer_base
+        params = {"item_number": artikelnummer_base}
+        resp_item = safe_get(url_item, headers, params=params)
+        if resp_item.status_code == 200 and resp_item.json():
+            item_id = resp_item.json()[0]["id"]
+            article_found = True
+        else:
+            # --- 2nd attempt: left-pad to length 7 with zeros
+            artikelnummer_padded = artikelnummer_base.zfill(7)
+            params = {"item_number": artikelnummer_padded}
+            print(f"[process_lookup] Retrying with zero-padded artikelnummer: {artikelnummer_padded}")
+            resp_item = safe_get(url_item, headers, params=params)
+            if resp_item.status_code == 200 and resp_item.json():
+                item_id = resp_item.json()[0]["id"]
+                article_found = True
+
+        if not article_found:
+            st.warning(f"Geen artikel gevonden voor {artikelnummer_base} (ook niet met padding)")
+            lookup_rows.append({
+                "artikelnummer": artikelnummer_full,
+                "kleurnummer": kleurnummer_clean,
+                "delivery_block": ""
+            })
+            time.sleep(DELAY_BETWEEN_REQUESTS)
+            progress.progress(int((i + 1) / n_rows * 100))
+            continue
+
+        url_colors = f"{BASE_URL}/items/{item_id}/colors"
+        found = False
+        try:
+            resp_colors = safe_get(url_colors, headers)
+            if resp_colors.status_code == 200 and resp_colors.json():
+                for color_obj in resp_colors.json():
+                    color_number_api = normalize_kleurnummer(color_obj["color"]["color_number"])
+                    if color_number_api == kleurnummer_clean:
+                        delivery_block_obj = color_obj.get("delivery_block")
+                        if isinstance(delivery_block_obj, dict):
+                            leverblok = delivery_block_obj.get("delivery_block", "")
+                        else:
+                            leverblok = ""
+                        lookup_rows.append({
+                            "artikelnummer": artikelnummer_full,
+                            "kleurnummer": kleurnummer_clean,
+                            "delivery_block": leverblok
+                        })
+                        found = True
+                        break
+            if not found:
+                lookup_rows.append({
+                    "artikelnummer": artikelnummer_full,
+                    "kleurnummer": kleurnummer_clean,
+                    "delivery_block": ""
+                })
+        except Exception as e:
+            st.warning(f"Fout bij ophalen kleuren voor {artikelnummer_base}: {e}")
+            lookup_rows.append({
+                "artikelnummer": artikelnummer_full,
+                "kleurnummer": kleurnummer_clean,
+                "delivery_block": ""
+            })
+        print(f"[main] Sleeping {DELAY_BETWEEN_REQUESTS}s between requests.")
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+        print(f"[main] Progress: {i+1}/{n_rows} ({int((i + 1) / n_rows * 100)}%)")
+        progress.progress(int((i + 1) / n_rows * 100))
+    return pd.DataFrame(lookup_rows)
+
+def merge_with_excel(df_excel, df_lookup, artikel_col, kleur_col, leverblok_col):
+    # Force merge keys to string, remove decimals from kleurnummer if needed
+    df_excel[artikel_col] = df_excel[artikel_col].astype(str).str.strip()
+    df_excel[kleur_col] = df_excel[kleur_col].apply(normalize_kleurnummer)
+    df_lookup["artikelnummer"] = df_lookup["artikelnummer"].astype(str).str.strip()
+    df_lookup["kleurnummer"] = df_lookup["kleurnummer"].apply(normalize_kleurnummer)
+
+    df_merge = df_excel.copy()
+    df_merge = pd.merge(
+        df_merge,
+        df_lookup,
+        how="left",
+        left_on=[artikel_col, kleur_col],
+        right_on=["artikelnummer", "kleurnummer"]
+    )
+    mask = df_merge["delivery_block"].notna() & (df_merge["delivery_block"] != "")
+    df_merge.loc[mask, leverblok_col] = df_merge.loc[mask, "delivery_block"]
+    df_merge = df_merge[df_excel.columns]
+    return df_merge
+
+def main():
+
+    st.markdown(
     """
     <div style="display: flex; justify-content: center; align-items: center; margin-bottom: 28px;">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2384.63 788.34" width="150">
@@ -26,64 +218,74 @@ st.markdown(
         </svg>
     </div>
     """,
-    unsafe_allow_html=True
-)
+    unsafe_allow_html=True)
+    
+    st.title("Buurfashion Leverblok Updater (Stap 1: Lookup → Stap 2: Merge)")
 
-st.title("Leverblok Updater - Artikelnummer Match")
+    if "token" not in st.session_state:
+        st.write("Stap 1: Inloggen")
+        username = st.text_input("Gebruikersnaam", key="username_input")
+        password = st.text_input("Wachtwoord", type="password", key="password_input")
+        login_btn = st.button("Inloggen")
+        if login_btn and username and password:
+            try:
+                token, expiry = get_bearer_token(username, password)
+                st.session_state.token = token
+                st.session_state.token_expiry = expiry
+                st.session_state.username = username
+                st.session_state.password = password
+                st.success("Succesvol ingelogd. Je kunt nu een Excel-bestand uploaden.")
+            except Exception as e:
+                st.error(f"Inloggen mislukt: {e}")
 
-st.header("Upload Files")
-excel_file = st.file_uploader("Upload 'check Bas.xlsx'", type=['xlsx'])
-csv_file = st.file_uploader("Upload 'artikel-data-export-17-06-2025-12_29.csv'", type=['csv'])
+    if "token" in st.session_state:
+        st.write("Stap 2: Upload Excel bestand 'check Bas.xlsx'")
+        file = st.file_uploader("Upload Excel", type=["xlsx"])
+        if file:
+            df = pd.read_excel(file)
+            df.columns = [str(c).strip() for c in df.columns]
+            artikel_col = [c for c in df.columns if c.lower() == 'artikelnummer'][0]
+            kleur_col = [c for c in df.columns if c.lower() == 'kleurnummer'][0]
+            leverblok_col = [c for c in df.columns if c.lower() == 'leverblok']
+            leverblok_col = leverblok_col[0] if leverblok_col else None
 
-if excel_file and csv_file:
-    # Read files
-    df_check = pd.read_excel(excel_file)
-    df_source = pd.read_csv(csv_file, delimiter=';', dtype=str, quoting=csv.QUOTE_MINIMAL)
+            if not leverblok_col:
+                df["Leverblok"] = ""
+                leverblok_col = "Leverblok"
 
-    # Ensure correct columns (assumes 'Artikelnummer' is column D in both, and 'Leverblok' is column O in Excel, BD in CSV)
-    check_art_col = df_check.columns[3]        # D
-    check_kleurnr_col = df_check.columns[5]    # F
-    check_lev_col = df_check.columns[14]       # O
-    source_art_col = df_source.columns[3]      # D
-    source_kleurnr_col = df_source.columns[52] # BA
-    source_lev_col = df_source.columns[55]     # BD
+            if "lookup_done" not in st.session_state or st.session_state.get("last_upload") != file.name:
+                st.session_state.lookup_df = None
+                st.session_state.merge_ready = False
+                st.session_state.lookup_done = False
+                st.session_state.last_upload = file.name
 
-    # Standardize Artikelnummer: remove trailing '000' in Excel version
-    df_check['Artikelnummer_match'] = df_check[check_art_col].astype(str).str.replace(r'000$', '', regex=True)
-    df_source[source_art_col] = df_source[source_art_col].astype(str)
+            if not st.session_state.lookup_done:
+                if st.button("Start lookup & download CSV"):
+                    lookup_df = process_lookup(df, artikel_col, kleur_col)
+                    st.session_state.lookup_df = lookup_df
+                    st.session_state.lookup_done = True
+                    st.success("Lookup afgerond! Download nu de CSV of ga verder met mergen.")
 
-    # Build a lookup for the source data on Artikelnummer
-    source_lookup = df_source.set_index(source_art_col)
+            if st.session_state.lookup_done and st.session_state.lookup_df is not None:
+                lookup_df_export = st.session_state.lookup_df[["artikelnummer", "kleurnummer", "delivery_block"]]
+                lookup_csv = lookup_df_export.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "Download lookup-resultaat (CSV)",
+                    data=lookup_csv,
+                    file_name="artikel_kleur_deliveryblock_lookup.csv",
+                    mime="text/csv"
+                )
 
-    # Helper: Get Leverblok value based on Artikelnummer and Kleurnummer
-    def get_leverblok_value(artnr, kleurnr):
-        matches = df_source[
-            (df_source[source_art_col] == artnr) &
-            (df_source[source_kleurnr_col] == kleurnr)
-        ]
-        if not matches.empty:
-            return matches.iloc[0][source_lev_col]
-        return None
+                if st.button("Merge en download bijgewerkte Excel"):
+                    merged_df = merge_with_excel(df, st.session_state.lookup_df, artikel_col, kleur_col, leverblok_col)
+                    output = io.BytesIO()
+                    merged_df.to_excel(output, index=False)
+                    st.download_button(
+                        "Download bijgewerkte Excel",
+                        data=output.getvalue(),
+                        file_name="check Bas updated.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
 
-    # Build updated Leverblok column
-    updated_leverblok = []
-    for idx, row in df_check.iterrows():
-        artnr = row['Artikelnummer_match']
-        kleurnr = row[check_kleurnr_col]
-        leverblok_val = get_leverblok_value(artnr, kleurnr)
-        if leverblok_val is not None:
-            updated_leverblok.append(leverblok_val)
-        else:
-            updated_leverblok.append(row[check_lev_col])  # keep original if no match
-
-    df_check[check_lev_col] = updated_leverblok
-    df_check.drop(columns=['Artikelnummer_match'], inplace=True)
-
-    # Output to Excel
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df_check.to_excel(writer, index=False)
-    st.success("Matching and updating done! Download the updated Excel file below:")
-    st.download_button("Download Updated Excel", data=output.getvalue(), file_name="check Bas updated.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-else:
-    st.info("Please upload both files to continue.")
+if __name__ == "__main__":
+    main()
