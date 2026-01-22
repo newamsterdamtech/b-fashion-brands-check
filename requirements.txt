@@ -2,4 +2,4 @@ pandas
 xlsxwriter
 openpyxl
 streamlit
-
+altair<5
